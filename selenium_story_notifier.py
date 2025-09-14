@@ -99,6 +99,14 @@ def send_hourly_report_email(new_viewers: list, total_viewers_count: int, new_sp
         for viewer in new_viewers:
             new_viewers_html += f"<li>{viewer}</li>"
         new_viewers_html += "</ul>"
+        if not new_special_users:
+            new_viewers_html += """
+                <hr style="border-color: #eee;">
+                <p style="font-size: 1em; font-style: italic; color: #888; text-align: center;">
+                    ...Y aunque la esperanza nunca muere, en esta hora la brújula no ha señalado el Norte. Brenda no ha hecho acto de presencia.
+                </p>
+                <hr style="border-color: #eee;">
+            """
 
     body_html = f"""
     <div style="font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px; color: #333;">
