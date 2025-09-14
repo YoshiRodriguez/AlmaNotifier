@@ -69,8 +69,10 @@ def send_email(subject: str, body: str, is_html=False):
         logger.error("Error al enviar el correo: %s", e)
 
 def send_hourly_report_email(new_viewers: list, total_viewers_count: int, new_special_users: list, last_check_time: str):
-
+    
     special_alert_html = ""
+    brenda_message_html = ""
+
     if "branvxvt" in new_special_users:
         special_alert_html = """
             <h3 style="color: red; text-align: center;">🚨 HA VUELTO 🚨</h3>
@@ -84,8 +86,10 @@ def send_hourly_report_email(new_viewers: list, total_viewers_count: int, new_sp
         special_alert_html = "<h3 style='color: red; text-align: center;'>🚨 ¡ALERTA! 🚨</h3>"
         for user in new_special_users:
             special_alert_html += f"<p style='color: red; font-weight: bold; text-align: center;'>El usuario especial {user} vió tu historia.</p>"
-    elif not new_special_users and not new_viewers:
-        special_alert_html = """
+    else:
+        # Este es el bloque que se ejecuta cuando no hay nuevos usuarios especiales.
+        # Lo movimos aquí para que siempre tenga un lugar definido en el HTML.
+        brenda_message_html = """
             <hr style="border-color: #eee;">
             <p style="font-size: 1em; font-style: italic; color: #888; text-align: center;">
                 ...Y aunque la esperanza nunca muere, en esta hora la brújula no ha señalado el Norte. Brenda no ha hecho acto de presencia.
@@ -99,15 +103,8 @@ def send_hourly_report_email(new_viewers: list, total_viewers_count: int, new_sp
         for viewer in new_viewers:
             new_viewers_html += f"<li>{viewer}</li>"
         new_viewers_html += "</ul>"
-        if not new_special_users:
-            new_viewers_html += """
-                <hr style="border-color: #eee;">
-                <p style="font-size: 1em; font-style: italic; color: #888; text-align: center;">
-                    ...Y aunque la esperanza nunca muere, en esta hora la brújula no ha señalado el Norte. Brenda no ha hecho acto de presencia.
-                </p>
-                <hr style="border-color: #eee;">
-            """
-
+    
+    # El cuerpo del HTML ahora es una construcción más limpia.
     body_html = f"""
     <div style="font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px; color: #333;">
         <div style="max-width: 600px; margin: auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1);">
@@ -120,7 +117,7 @@ def send_hourly_report_email(new_viewers: list, total_viewers_count: int, new_sp
             </div>
 
             {special_alert_html}
-
+            {brenda_message_html}
             {new_viewers_html}
 
             <p style="font-size: 0.8em; color: #aaa; text-align: center; margin-top: 30px;">
