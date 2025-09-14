@@ -1,10 +1,3 @@
-"""
-Un script para monitorear los espectadores de historias de Instagram
-usando Selenium para la automatización del navegador. El script inicia sesión,
-navega a las historias y notifica por correo electrónico cuando nuevos
-espectadores de una lista específica ven la historia.
-"""
-
 import os
 import time
 import random
@@ -12,11 +5,6 @@ import json
 import logging
 import threading
 from typing import Optional
-from email.message import EmailMessage
-import smtplib
-from datetime import datetime
-
-# Third party imports
 from dotenv import load_dotenv
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -30,472 +18,449 @@ from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.firefox.firefox_profile import FirefoxProfile
 from selenium.webdriver.firefox.service import Service as FirefoxService
 from webdriver_manager.firefox import GeckoDriverManager
+from email.message import EmailMessage
+import smtplib
+from datetime import datetime, timedelta
 
-# Cargar variables de entorno
+# --- load environment ---
 load_dotenv()
 
-# Configuración del logger
-LOG_FILE_PATH = "logs/selenium_story_notifier.log"
-os.makedirs(os.path.dirname(LOG_FILE_PATH), exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE_PATH, mode="w"),
-        logging.StreamHandler(),
-    ],
-)
-logger = logging.getLogger(__name__)
-
-# Configuración de variables
-INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME")
-INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD")
-TARGET_USERS = os.getenv("TARGET_USERS", "").split(",")
-SPECIAL_TARGET_USERS = os.getenv("SPECIAL_TARGET_USERS", "").split(",")
-FIREFOX_PROFILE_PATH = os.getenv("FIREFOX_PROFILE_PATH")
-TO_EMAIL = os.getenv("TO_EMAIL")
-SMTP_HOST = os.getenv("SMTP_HOST")
-SMTP_PORT = os.getenv("SMTP_PORT")
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.office365.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
-SEEN_FILE = "seen_users.json"
+TO_EMAIL = os.getenv("TO_EMAIL", SMTP_USER)
 
+INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME")
+FIREFOX_PROFILE_PATH = os.getenv("FIREFOX_PROFILE_PATH")
 
-def load_seen():
-    """Carga los usuarios vistos desde un archivo JSON."""
-    if os.path.exists(SEEN_FILE):
-        try:
-            with open(SEEN_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f))
-        except (IOError, json.JSONDecodeError) as e:
-            logger.error("Error al cargar el archivo de usuarios vistos: %s", e)
-    return set()
+POLL_INTERVAL_BASE = int(os.getenv("POLL_INTERVAL_BASE", "300"))
+POLL_INTERVAL_RANDOM_RANGE = int(os.getenv("POLL_INTERVAL_RANDOM_RANGE", "120"))
+RUN_START_HOUR = int(os.getenv("RUN_START_HOUR", "8"))
+RUN_END_HOUR = int(os.getenv("RUN_END_HOUR", "22"))
+STORED_FILE = os.getenv("STORED_FILE", "seen_viewers.json")
 
+SPECIAL_USERS_STR = os.getenv("SPECIAL_USERS", "")
+SPECIAL_USERS = {user.strip().lower() for user in SPECIAL_USERS_STR.split(',') if user.strip()}
 
-def save_seen(seen_users: set):
-    """Guarda los usuarios vistos en un archivo JSON."""
-    with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(seen_users), f, ensure_ascii=False, indent=4)
+# logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("insta-selenium")
 
-
+# --- helper: smtp email ---
 def send_email(subject: str, body: str, is_html=False):
-    """Envía un correo electrónico a la dirección TO_EMAIL configurada.
-
-    Args:
-        subject (str): El asunto del correo.
-        body (str): El cuerpo del mensaje.
-        is_html (bool, optional): Indica si el cuerpo es HTML. Por defecto es False.
-    """
-    if TO_EMAIL is None:
-        logger.warning("No se puede enviar el correo porque TO_EMAIL no está configurado.")
-        return
-
     msg = EmailMessage()
-    msg["Subject"] = subject
     msg["From"] = SMTP_USER
     msg["To"] = TO_EMAIL
+    msg["Subject"] = subject
     if is_html:
-        msg.add_alternative(body, subtype="html")
+        msg.add_alternative(body, subtype='html')
     else:
         msg.set_content(body)
-
     try:
-        if SMTP_USER is None or SMTP_PASS is None or SMTP_HOST is None or SMTP_PORT is None:
-            raise ValueError("SMTP_USER, SMTP_PASS, SMTP_HOST y SMTP_PORT deben estar " \
-            "configurados en su archivo .env")
-
-        with smtplib.SMTP(SMTP_HOST, int(SMTP_PORT)) as server:
+        if SMTP_USER is None or SMTP_PASS is None:
+            raise ValueError("SMTP_USER y SMTP_PASS deben estar configurados en su archivo .env")
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
             server.starttls()
             server.login(SMTP_USER, SMTP_PASS)
             server.send_message(msg)
         logger.info("Correo enviado: %s", subject)
-    except (smtplib.SMTPException, OSError, ValueError) as e:
+    except Exception as e:
         logger.error("Error al enviar el correo: %s", e)
 
+def send_hourly_report_email(new_viewers: list, total_viewers_count: int, new_special_users: list, last_check_time: str):
 
-def make_driver():
-    """Crea y configura el controlador de Selenium para Firefox.
+    special_alert_html = ""
+    if "branvxvt" in new_special_users:
+        special_alert_html = """
+            <h3 style="color: red; text-align: center;">🚨 HA VUELTO 🚨</h3>
+            <p style="font-size: 1.2em; font-weight: bold; text-align: center;">
+                Se ha detectado la presencia de la mismísima <span style="font-style: italic;">Brenda</span>.
+                Aquello que esperabas ha sucedido, y ella ha decidido "honrar" tu historia con su vista.
+                ¿Qué proseguirá ahora? Solo el tiempo lo dirá.
+            </p>
+        """
+    elif new_special_users:
+        special_alert_html = "<h3 style='color: red; text-align: center;'>🚨 ¡ALERTA! 🚨</h3>"
+        for user in new_special_users:
+            special_alert_html += f"<p style='color: red; font-weight: bold; text-align: center;'>El usuario especial {user} vió tu historia.</p>"
+    elif not new_special_users and not new_viewers:
+        special_alert_html = """
+            <hr style="border-color: #eee;">
+            <p style="font-size: 1em; font-style: italic; color: #888; text-align: center;">
+                ...Y aunque la esperanza nunca muere, en esta hora la brújula no ha señalado el Norte. Brenda no ha hecho acto de presencia.
+            </p>
+            <hr style="border-color: #eee;">
+        """
 
-    Returns:
-        webdriver.Firefox: La instancia del controlador de Firefox.
+    new_viewers_html = ""
+    if new_viewers:
+        new_viewers_html = "<h3>Nuevos espectadores encontrados en esta hora:</h3><ul>"
+        for viewer in new_viewers:
+            new_viewers_html += f"<li>{viewer}</li>"
+        new_viewers_html += "</ul>"
 
-    Raises:
-        ValueError: Si el perfil de Firefox no se puede cargar.
-        WebDriverException: Si hay un error al iniciar el controlador.
+    body_html = f"""
+    <div style="font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px; color: #333;">
+        <div style="max-width: 600px; margin: auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1);">
+            <h2 style="text-align: center; color: #555;">📦 Reporte Horario de Alma</h2>
+            <p style="font-size: 0.9em; color: #777; text-align: center;">Última verificación: <strong>{last_check_time}</strong></p>
+            <hr style="border-color: #eee;">
+            <div style="text-align: center;">
+                <p style="font-size: 1.2em; margin: 0;">Total de espectadores de la historia:</p>
+                <p style="font-size: 2em; font-weight: bold; color: #007BFF; margin: 5px 0 20px;">{total_viewers_count}</p>
+            </div>
+
+            {special_alert_html}
+
+            {new_viewers_html}
+
+            <p style="font-size: 0.8em; color: #aaa; text-align: center; margin-top: 30px;">
+                Este correo fue generado automáticamente por Alma, tu vigilante de Instagram.
+            </p>
+        </div>
+    </div>
     """
-    options = Options()
-    options.add_argument("-headless")
+    send_email("📦 Reporte Horario de Alma - Instagram", body_html, is_html=True)
 
-    if not FIREFOX_PROFILE_PATH or not os.path.exists(FIREFOX_PROFILE_PATH):
-        raise ValueError(
-            f"El perfil de Firefox no se encontró en la ruta: {FIREFOX_PROFILE_PATH}. "
-            "Por favor, verifique la ruta y que el perfil existe."
-        )
+# --- storage ---
+def load_seen():
+    if os.path.exists(STORED_FILE):
+        try:
+            with open(STORED_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_seen(data):
+    with open(STORED_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+# --- Selenium setup ---
+def make_driver():
+    if not FIREFOX_PROFILE_PATH:
+        raise ValueError("FIREFOX_PROFILE_PATH debe estar configurado en su archivo .env")
 
     try:
         profile = FirefoxProfile(FIREFOX_PROFILE_PATH)
-    except OSError as e:
-        raise ValueError(
-            f"No se pudo cargar el perfil de Firefox en {FIREFOX_PROFILE_PATH}: {e}"
-        ) from e
+    except Exception as e:
+        raise ValueError(f"No se pudo cargar el perfil de Firefox en {FIREFOX_PROFILE_PATH}: {e}") from e
 
+    options = Options()
     options.profile = profile
+    options.add_argument("--headless")
 
     service = FirefoxService(GeckoDriverManager().install())
     driver = webdriver.Firefox(service=service, options=options)
-    logger.info(
-        "✅ Se ha creado exitosamente la instancia de Firefox en modo headless "
-        "con el perfil existente."
-    )
+
+    logger.info("✅ Se ha creado exitosamente la instancia de Firefox en modo headless con el perfil existente.")
     return driver
 
-
-def login(driver):
-    """Inicia sesión en Instagram si es necesario.
-
-    Args:
-        driver (webdriver.Firefox): La instancia del controlador de Firefox.
-    """
-    driver.get("https://www.instagram.com/")
-
+# --- scraping logic ---
+def open_my_profile(driver):
+    wait = WebDriverWait(driver, 10)
+    if INSTAGRAM_USERNAME:
+        url = f"https://www.instagram.com/{INSTAGRAM_USERNAME}/"
+    else:
+        url = "https://www.instagram.com/"
+    driver.get(url)
+    logger.info("Abierto %s", url)
     try:
-        WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable(
-                (By.CSS_SELECTOR, "input[name='username']")
-            )
-        )
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    except TimeoutException:
+        logger.warning("Tiempo de espera agotado al cargar la página.")
 
-        driver.find_element(By.CSS_SELECTOR, "input[name='username']").send_keys(
-            INSTAGRAM_USERNAME
-        )
-        driver.find_element(By.CSS_SELECTOR, "input[name='password']").send_keys(
-            INSTAGRAM_PASSWORD
-        )
-        driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
-
-        time.sleep(5)
-
-        # Manejar el posible diálogo de "Guardar información de inicio de sesión"
-        try:
-            WebDriverWait(driver, 5).until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, "//div[text()='Ahora no']")
-                )
-            ).click()
-        except TimeoutException:
-            pass  # El diálogo no apareció, no hay problema
-
-        logger.info("✅ Inicio de sesión exitoso en Instagram.")
-
-    except WebDriverException as e:
-        logger.error("Error durante el inicio de sesión: %s", e)
-
+def get_story_info(driver):
+    try:
+        timestamp_element = driver.find_element(By.CSS_SELECTOR, 'time.x197sbye')
+        relative_time = timestamp_element.text
+        iso_time = timestamp_element.get_attribute("datetime")
+        return relative_time, iso_time
+    except Exception:
+        return "N/A", None
 
 def open_latest_story(driver):
-    """Abre la última historia disponible en la página principal.
-
-    Args:
-        driver (webdriver.Firefox): La instancia del controlador de Firefox.
-
-    Returns:
-        bool: True si se abrió una historia, False en caso contrario.
-    """
-    logger.info("Buscando si hay historias nuevas para ver...")
-
-    story_button_xpath = (
-        "//div[contains(@aria-label, 'Stories') and "
-        "not(contains(@aria-label, 'History'))]"
-    )
-
+    wait = WebDriverWait(driver, 15)
     try:
-        story_button = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.XPATH, story_button_xpath))
-        )
-        story_button.click()
+        story_ring_xpath = "//div[@role='button' and .//canvas]"
+        story_ring = wait.until(EC.element_to_be_clickable((By.XPATH, story_ring_xpath)))
 
-        logger.info("✅ Se ha abierto la última historia disponible.")
-        time.sleep(3)
+        logger.info("Haciendo clic en el círculo de la historia del perfil para abrir la última historia.")
+        story_ring.click()
+        time.sleep(random.uniform(1.0, 2.5))
         return True
     except TimeoutException:
-        logger.warning(
-            "No se pudo encontrar el círculo de la historia. No hay una historia "
-            "nueva o la UI ha cambiado."
-        )
+        logger.warning("No se pudo encontrar el círculo de la historia. No hay una historia nueva o la UI ha cambiado.")
         return False
-    except WebDriverException as e:
+    except Exception as e:
         logger.error("Error al abrir la historia: %s", e)
         return False
 
-
 def fetch_viewers_from_open_story(driver):
-    """Extrae los nombres de usuario de los espectadores de la historia abierta.
-
-    Args:
-        driver (webdriver.Firefox): La instancia del controlador de Firefox.
-
-    Returns:
-        list: Una lista ordenada de los nombres de usuario de los espectadores.
-    """
-    logger.info("Extrayendo los espectadores de la historia...")
-    viewers_button_xpath = (
-        "//div[@role='button' and .//span[contains(text(), 'Vista por') or "
-        "contains(text(), 'Viewed by')]]"
-    )
+    wait = WebDriverWait(driver, 10)
 
     try:
-        viewers_button = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.XPATH, viewers_button_xpath))
-        )
+        viewers_button_xpath = "//div[@role='button' and .//span[contains(text(), 'Vista por') or contains(text(), 'Viewed by')]]"
+        viewers_button = wait.until(EC.element_to_be_clickable((By.XPATH, viewers_button_xpath)))
         viewers_button.click()
+        time.sleep(2)
 
-        time.sleep(3)
-
-        # Esperar a que el diálogo de espectadores aparezca
-        dialog_xpath = "//div[@role='dialog' and @aria-modal='true']"
-        dialog = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.XPATH, dialog_xpath))
+        viewers_dialog = wait.until(
+            EC.presence_of_element_located((By.XPATH, "//h2[contains(text(), 'Personas que vieron la historia') or contains(text(), 'Story viewers')]/ancestor::div[starts-with(@class, 'xs83m0k')]"))
         )
+        scrollable_container = viewers_dialog.find_element(By.XPATH, ".//div[contains(@style, 'overflow: hidden auto;')]")
 
         all_usernames = set()
-        last_height = driver.execute_script("return arguments[0].scrollHeight", dialog)
+        last_user_count = 0
 
         while True:
-            # Obtener todos los nombres de usuario
-            username_elements = dialog.find_elements(
-                By.XPATH, ".//div[@class='_aacl _aaco _aacv _aacy _aad6 _aade']"
-            )
+            driver.execute_script("arguments[0].scrollTop += 100;", scrollable_container)
+            time.sleep(1)
 
-            for element in username_elements:
-                all_usernames.add(element.text)
+            current_anchors = scrollable_container.find_elements(By.XPATH, ".//a[starts-with(@href, '/')]")
+            for a in current_anchors:
+                href = a.get_attribute("href")
+                if href and '/' in href:
+                    username = href.split("instagram.com/")[-1].split('?')[0].strip('/')
+                    if username:
+                        all_usernames.add(username)
 
-            # Scroll down
-            driver.execute_script(
-                "arguments[0].scrollTop = arguments[0].scrollHeight", dialog
-            )
-            time.sleep(2)
-
-            new_height = driver.execute_script("return arguments[0].scrollHeight", dialog)
-            if new_height == last_height:
+            new_user_count = len(all_usernames)
+            if new_user_count == last_user_count:
                 break
-            last_height = new_height
 
+            last_user_count = new_user_count
+
+        logger.info("Se han recopilado %d nombres de usuario del panel de espectadores.", len(all_usernames))
         return sorted(list(all_usernames))
+
     except TimeoutException:
-        logger.warning(
-            "No se pudo encontrar el botón de espectadores o el diálogo. "
-            "La UI pudo haber cambiado."
-        )
+        logger.warning("No se pudo encontrar el botón de espectadores o el diálogo. La UI pudo haber cambiado.")
         return []
-    except WebDriverException as e:
+    except Exception as e:
         logger.exception("Error al obtener los espectadores: %s", e)
         return []
 
+# --- main loop ---
+def main(stop_flag: Optional[threading.Event] = None, update_gui_callback=None):
+    if not SMTP_USER or not SMTP_PASS:
+        raise ValueError("SMTP_USER y SMTP_PASS deben estar configurados en su archivo .env")
 
-def get_story_publish_time(driver):
-    """Obtiene la hora de publicación de la historia.
-
-    Args:
-        driver (webdriver.Firefox): La instancia del controlador de Firefox.
-
-    Returns:
-        datetime.datetime: La hora de publicación de la historia.
-    """
-    try:
-        time_element = WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located((By.TAG_NAME, "time"))
-        )
-        iso_time = time_element.get_attribute("datetime")
-        if iso_time:
-            return datetime.fromisoformat(iso_time.replace("Z", "+00:00"))
-        else:
-            logger.warning("El atributo 'datetime' no está presente en el elemento <time>.")
-            return datetime.now()
-    except WebDriverException:
-        logger.warning("No se pudo obtener la hora de publicación de la historia.")
-        return datetime.now()
-
-
-def get_relative_time_info(story_time):
-    """Calcula el tiempo relativo desde la publicación de la historia.
-
-    Args:
-        story_time (datetime.datetime): La hora de publicación de la historia.
-
-    Returns:
-        tuple: Una tupla con la cadena de tiempo relativo y las horas transcurridas.
-    """
-    now = datetime.now(story_time.tzinfo)
-    delta = now - story_time
-    total_seconds = delta.total_seconds()
-    relative_hours = total_seconds // 3600
-
-    if total_seconds < 60:
-        return f"{int(total_seconds)} segundos", relative_hours
-    if total_seconds < 3600:
-        minutes = int(total_seconds // 60)
-        return f"{minutes} minutos", relative_hours
-    if relative_hours < 24:
-        return f"{int(relative_hours)} horas", relative_hours
-
-    days = int(relative_hours // 24)
-    return f"{days} días", relative_hours
-
-
-def check_for_new_viewers(driver, seen_users: set):
-    """Comprueba si hay nuevos espectadores y envía notificaciones.
-
-    Args:
-        driver (webdriver.Firefox): La instancia del controlador de Firefox.
-        seen_users (set): Un conjunto de usuarios que ya han sido vistos.
-    """
-    time.sleep(random.randint(5, 15))
-
-    if not open_latest_story(driver):
-        return
-
-    story_time = get_story_publish_time(driver)
-    relative_time, relative_hours = get_relative_time_info(story_time)
-
-    all_viewers = fetch_viewers_from_open_story(driver)
-
-    current_viewers_set = set(all_viewers)
-
-    if not current_viewers_set:
-        logger.info("No hay espectadores de la historia todavía. Esperando...")
-        return
-
-    new_viewers = current_viewers_set - seen_users
-
-    if not new_viewers:
-        logger.info("No se han detectado nuevos espectadores. Siguiente verificación en 5 minutos.")
-        return
-
-    logger.info("Se han detectado nuevos espectadores: %s", new_viewers)
-
-    new_special_users = list(
-        set(TARGET_USERS).intersection(new_viewers)
-    )
-    new_special_users_in_check = list(
-        set(SPECIAL_TARGET_USERS).intersection(new_viewers)
-    )
-
-    if not new_special_users and not new_special_users_in_check:
-        logger.info("Ninguno de los nuevos espectadores está en la lista objetivo.")
-        seen_users.update(new_viewers)
-        return
-
-    # Preparar el correo electrónico
-    new = new_special_users + new_special_users_in_check
-
-    subject = "Nuevos Espectadores de Historias"
-    if new_special_users_in_check:
-        if "branvxvt" in new_special_users_in_check:
-            subject = "🚨 HA VUELTO: ¡Brenda acaba de ver tu historia!"
-        else:
-            subject = (
-                f"🚨 ALERTA DE USUARIO: ¡{', '.join(new_special_users_in_check)} "
-                "acaba de ver tu historia!"
-            )
-
-    special_message_html = ""
-    if "branvxvt" in new_special_users_in_check:
-        special_message_html = """
-            <h3 style="color: #6a1b9a; text-align: center;">🌌 El Universo ha Conspirado 🌌</h3>
-            <p style="font-size: 1.2em; font-weight: bold; text-align: center; color: #4a148c;">
-                ¡Una aparición digna de las estrellas! <span style="font-style: italic; color: #8e24aa;">Brenda</span> ha hecho acto de presencia.
-                Un simple vistazo, pero, ¿qué significa para ti? ¿Qué significa en realidad?.
-            </p>
-            <hr style="border-color: #e1bee7;">
-        """
-
-    other_special_users_html = """
-        <div style="text-align: center;">
-            """
-    for user in new_special_users_in_check:
-        if user != "branvxvt":
-            other_special_users_html += f"""
-                <p style='color: red; font-weight: bold; font-size: 1.5em;'>🚨 ¡{user} acaba de ver tu historia! 🚨</p>
-            """
-    other_special_users_html += "</div>"
-    if "branvxvt" not in new_special_users_in_check:
-        other_special_users_html = (
-            "<hr style='border-color: #333;'>"
-            + other_special_users_html
-            + "<hr style='border-color: #333;'>"
-        )
-
-    body_html = f"""
-        <div style="font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px; color: #333;">
-            <div style="max-width: 600px; margin: auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1);">
-                <h2 style="text-align: center; color: #555;">🚀 ¡Nuevos Espectadores de Historias de Instagram!</h2>
-                <hr style="border-color: #eee;">
-
-                <p style="font-size: 0.9em; color: #777; text-align: center;">
-                    Esta historia fue publicada hace {relative_time}.
-                </p>
-
-                {"<p style='color: orange; font-weight: bold; text-align: center;'>⚠️ ¡Esta historia está a punto de caducar!</p>"
-                 if relative_hours is not None and relative_hours >= 23 else ""
-                }
-
-                {special_message_html}
-
-                {other_special_users_html}
-
-                <h3>Nuevos Espectadores:</h3>
-                <ul>
-                    {''.join([f"<li>{viewer}</li>" for viewer in new])}
-                </ul>
-            </div>
-        </div>
-    """
-
-    send_email(subject, body_html, is_html=True)
-
-    seen_users.update(new_viewers)
-    logger.info("Se han agregado %s nuevos usuarios al conjunto de vistos.", len(new_viewers))
-
-
-def main(stop_flag: Optional[threading.Event] = None):
-    """Función principal para ejecutar el scraper de historias de Instagram.
-
-    Args:
-        stop_flag (threading.Event, optional): Un evento para detener el bucle
-            principal. Defaults to None.
-    """
     seen = load_seen()
-    driver = None
+    special_user_seen_status = {user: user in seen.get('all_viewers', []) for user in SPECIAL_USERS}
+    story_id = None # Initialize story_id
 
+    driver = None
     try:
         driver = make_driver()
-        login(driver)
-
-        while not stop_flag or not stop_flag.is_set():
-            check_for_new_viewers(driver, seen)
-
-            wait_time = random.randint(300, 600)
-
-            logger.info("Esperando %s segundos para la próxima verificación...", wait_time)
-
-            if stop_flag:
-                stop_flag.wait(wait_time)
-            else:
-                time.sleep(wait_time)
-
-    except json.JSONDecodeError as e:
-        logger.exception("Ha ocurrido un error inesperado de decodificación JSON: %s", e)
-    except (WebDriverException, ValueError) as e:
+    except WebDriverException as e:
         logger.error("Error al iniciar el controlador de Firefox: %s", e)
         return
+    except ValueError as e:
+        logger.error("Error de configuración: %s", e)
+        return
+
+    last_report_time = datetime.now()
+    new_viewers_this_hour = set()
+    new_special_users_this_hour = set()
+
+    try:
+        open_my_profile(driver)
+
+        while True:
+            current_time = datetime.now()
+            current_hour = current_time.hour
+            is_in_range = False
+
+            if RUN_START_HOUR <= RUN_END_HOUR:
+                if RUN_START_HOUR <= current_hour < RUN_END_HOUR:
+                    is_in_range = True
+            else:
+                if current_hour >= RUN_START_HOUR or current_hour < RUN_END_HOUR:
+                    is_in_range = True
+
+            if not is_in_range:
+                logger.info("Fuera del horario de ejecución (%d:00 - %d:00). Durmiendo hasta la próxima hora de inicio.", RUN_START_HOUR, RUN_END_HOUR)
+
+                if current_hour < RUN_START_HOUR:
+                    time_to_wait = (RUN_START_HOUR - current_hour) * 3600
+                else:
+                    time_to_wait = ((24 - current_hour) + RUN_START_HOUR) * 3600
+
+                time.sleep(time_to_wait)
+                continue
+
+            if stop_flag and stop_flag.is_set():
+                logger.info("Bandera de detención detectada. Saliendo del bucle principal.")
+                break
+
+            if (current_time - last_report_time) >= timedelta(hours=1):
+                logger.info("Enviando reporte horario...")
+                total_viewers_for_report = len(seen.get(story_id, [])) if story_id else 0
+                send_hourly_report_email(
+                    list(new_viewers_this_hour),
+                    total_viewers_for_report,
+                    list(new_special_users_this_hour),
+                    current_time.strftime("%Y-%m-%d %H:%M:%S")
+                )
+                last_report_time = current_time
+                new_viewers_this_hour = set()
+                new_special_users_this_hour = set()
+
+            logger.info("Comprobando nuevos espectadores de historias...")
+            driver.get(f"https://www.instagram.com/{INSTAGRAM_USERNAME}/")
+            time.sleep(5)
+
+            ok = open_latest_story(driver)
+            if not ok:
+                logger.warning("No se pudo abrir la historia en este momento. Se reintentará más tarde.")
+                story_id = None
+                if update_gui_callback:
+                    update_gui_callback(
+                        last_check_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        total_viewers="N/A",
+                        story_age="N/A"
+                    )
+
+                time.sleep(POLL_INTERVAL_BASE + random.uniform(0, POLL_INTERVAL_RANDOM_RANGE))
+                continue
+
+            relative_time, story_id = get_story_info(driver)
+            if not story_id:
+                logger.warning("No se pudo obtener un ID único para la historia. Pasando a la siguiente revisión.")
+                if update_gui_callback:
+                    update_gui_callback(
+                        last_check_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        total_viewers="N/A",
+                        story_age="N/A"
+                    )
+
+                continue
+
+            viewers = fetch_viewers_from_open_story(driver)
+
+            if update_gui_callback:
+                update_gui_callback(
+                    last_check_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    total_viewers=len(viewers),
+                    story_age=relative_time
+                )
+
+            if story_id not in seen:
+                seen[story_id] = []
+                logger.info("Nueva historia detectada con ID: %s", story_id)
+
+            prev = set(seen.get(story_id, []))
+            new = set(viewers) - prev
+
+            lowercase_viewers = {v.lower() for v in viewers}
+
+            for user in SPECIAL_USERS:
+                if user in special_user_seen_status and special_user_seen_status[user] and user not in lowercase_viewers:
+                    logger.warning(f"El usuario especial {user} ya no está en la lista de espectadores.")
+                    subject = f"🚨 ADVERTENCIA: {user} podría haberte bloqueado."
+                    body = f"Parece que **{user}** ya no está en la lista de espectadores de tu historia. Es posible que te haya bloqueado o restringido."
+                    send_email(subject, body, is_html=True)
+                    special_user_seen_status[user] = False
+                elif user not in special_user_seen_status or (user in lowercase_viewers and not special_user_seen_status[user]):
+                    special_user_seen_status[user] = True
+                    new_special_users_this_hour.add(user)
+
+            if new:
+                logger.info("Se han detectado nuevos espectadores: %s", new)
+                new_special_users_in_check = {user for user in SPECIAL_USERS if user in {v.lower() for v in new}}
+
+                subject = "Nuevos Espectadores de Historias"
+                if new_special_users_in_check:
+                    if "branvxvt" in new_special_users_in_check:
+                        subject = f"🚨 HA VUELTO: ¡Brenda acaba de ver tu historia!"
+                    else:
+                        subject = f"🚨 ALERTA DE USUARIO: ¡{', '.join(new_special_users_in_check)} acaba de ver tu historia!"
+
+                relative_hours = None
+                try:
+                    relative_hours_str = relative_time.split(" ")[0]
+                    if relative_hours_str.isdigit():
+                        relative_hours = int(relative_hours_str)
+                except Exception:
+                    pass
+
+                # Nuevo bloque para generar el mensaje especial de Brenda
+                special_message_html = ""
+                if "branvxvt" in new_special_users_in_check:
+                    special_message_html = f"""
+                        <h3 style="color: #6a1b9a; text-align: center;">🌌 El Universo ha Conspirado 🌌</h3>
+                        <p style="font-size: 1.2em; font-weight: bold; text-align: center; color: #4a148c;">
+                            ¡Una aparición digna de las estrellas! <span style="font-style: italic; color: #8e24aa;">Brenda</span> ha hecho acto de presencia.
+                            Un simple vistazo, pero, ¿qué significa para ti? ¿Qué significa en realidad?.
+                        </p>
+                        <hr style="border-color: #e1bee7;">
+                    """
+
+                other_special_users_html = ""
+                if len(new_special_users_in_check) > 1 or ("branvxvt" not in new_special_users_in_check and new_special_users_in_check):
+                    other_special_users_html = """
+                        <div style="text-align: center;">
+                            """
+                    for user in new_special_users_in_check:
+                        if user != "branvxvt":
+                            other_special_users_html += f"""<p style='color: red; font-weight: bold; font-size: 1.5em;'>🚨 ¡{user} acaba de ver tu historia! 🚨</p>"""
+                    other_special_users_html += "</div>"
+                    if "branvxvt" not in new_special_users_in_check:
+                        other_special_users_html = f"<hr style='border-color: #333;'>" + other_special_users_html + f"<hr style='border-color: #333;'>"
+
+                # --- El resto del body_html (sin cambios sustanciales) ---
+                body_html = f"""
+                <div style="font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px; color: #333;">
+                    <div style="max-width: 600px; margin: auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1);">
+                        <h2 style="text-align: center; color: #555;">🚀 ¡Nuevos Espectadores de Historias de Instagram!</h2>
+                        <hr style="border-color: #eee;">
+
+                        <p style="font-size: 0.9em; color: #777; text-align: center;">
+                            Esta historia fue publicada hace {relative_time}.
+                        </p>
+
+                        {"<p style='color: orange; font-weight: bold; text-align: center;'>⚠️ ¡Esta historia está a punto de caducar!</p>" if relative_hours is not None and relative_hours >= 23 else ""}
+
+                        {special_message_html}
+
+                        {other_special_users_html}
+
+                        <h3>Nuevos Espectadores:</h3>
+                        <ul>
+                            {''.join([f"<li>{viewer}</li>" for viewer in new])}
+                        </ul>
+                    </div>
+                </div>
+                """
+
+                send_email(subject, body_html, is_html=True)
+
+                seen[story_id] = sorted(list(set(viewers) | prev))
+                save_seen(seen)
+
+                new_viewers_this_hour.update(new - new_special_users_in_check)
+
+            else:
+                logger.info("No se encontraron nuevos espectadores en esta revisión. Total de espectadores: %d", len(viewers))
+
+            try:
+                driver.switch_to.active_element.send_keys("\uE00C")
+            except WebDriverException:
+                pass
+
+            sleep_for = POLL_INTERVAL_BASE + random.uniform(0, POLL_INTERVAL_RANDOM_RANGE)
+            logger.info("Durmiendo por %.1f segundos.", sleep_for)
+            time.sleep(sleep_for)
+
     except KeyboardInterrupt:
-        logger.warning("Programa interrumpido por el usuario.")
-    except (OSError, smtplib.SMTPException) as e:
-        logger.exception("Ha ocurrido un error inesperado: %s", e)
+        logger.info("Interrumpido por el usuario.")
     finally:
         if driver:
             try:
                 driver.quit()
-            except WebDriverException:
+            except Exception:
                 pass
         save_seen(seen)
         logger.info("Saliendo.")
