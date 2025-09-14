@@ -101,7 +101,8 @@ def send_email(subject: str, body: str, is_html=False):
 
     try:
         if SMTP_USER is None or SMTP_PASS is None or SMTP_HOST is None or SMTP_PORT is None:
-            raise ValueError("SMTP_USER, SMTP_PASS, SMTP_HOST y SMTP_PORT deben estar configurados en su archivo .env")
+            raise ValueError("SMTP_USER, SMTP_PASS, SMTP_HOST y SMTP_PORT deben estar " \
+            "configurados en su archivo .env")
 
         with smtplib.SMTP(SMTP_HOST, int(SMTP_PORT)) as server:
             server.starttls()
