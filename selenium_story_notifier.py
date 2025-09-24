@@ -4,6 +4,7 @@ import random
 import json
 import logging
 import threading
+import pyodbc
 from typing import Optional
 from dotenv import load_dotenv
 from selenium import webdriver
@@ -43,6 +44,9 @@ STORED_FILE = os.getenv("STORED_FILE", "seen_viewers.json")
 SPECIAL_USERS_STR = os.getenv("SPECIAL_USERS", "")
 SPECIAL_USERS = {user.strip().lower() for user in SPECIAL_USERS_STR.split(',') if user.strip()}
 
+DB_SERVER = os.getenv("DB_SERVER", "DESKTOP-T432ACE\\GTESTER")
+DB_NAME = os.getenv("DB_NAME", "dbFLDSMDFR")
+
 # logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("insta-selenium")
@@ -68,12 +72,12 @@ def send_email(subject: str, body: str, is_html=False):
     except Exception as e:
         logger.error("Error al enviar el correo: %s", e)
 
-def send_hourly_report_email(new_viewers: list, total_viewers_count: int, new_special_users: list, last_check_time: str):
-    
+def send_hourly_report_email(new_viewers: list, total_viewers_count: int, special_users_this_hour: list, last_check_time: str):
+
     special_alert_html = ""
     brenda_message_html = ""
 
-    if "branvxvt" in new_special_users:
+    if "branvxvt" in special_users_this_hour:
         special_alert_html = """
             <h3 style="color: red; text-align: center;">🚨 HA VUELTO 🚨</h3>
             <p style="font-size: 1.2em; font-weight: bold; text-align: center;">
@@ -82,13 +86,11 @@ def send_hourly_report_email(new_viewers: list, total_viewers_count: int, new_sp
                 ¿Qué proseguirá ahora? Solo el tiempo lo dirá.
             </p>
         """
-    elif new_special_users:
+    elif special_users_this_hour:
         special_alert_html = "<h3 style='color: red; text-align: center;'>🚨 ¡ALERTA! 🚨</h3>"
-        for user in new_special_users:
+        for user in special_users_this_hour:
             special_alert_html += f"<p style='color: red; font-weight: bold; text-align: center;'>El usuario especial {user} vió tu historia.</p>"
     else:
-        # Este es el bloque que se ejecuta cuando no hay nuevos usuarios especiales.
-        # Lo movimos aquí para que siempre tenga un lugar definido en el HTML.
         brenda_message_html = """
             <hr style="border-color: #eee;">
             <p style="font-size: 1em; font-style: italic; color: #888; text-align: center;">
@@ -103,8 +105,7 @@ def send_hourly_report_email(new_viewers: list, total_viewers_count: int, new_sp
         for viewer in new_viewers:
             new_viewers_html += f"<li>{viewer}</li>"
         new_viewers_html += "</ul>"
-    
-    # El cuerpo del HTML ahora es una construcción más limpia.
+
     body_html = f"""
     <div style="font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px; color: #333;">
         <div style="max-width: 600px; margin: auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1);">
@@ -127,6 +128,70 @@ def send_hourly_report_email(new_viewers: list, total_viewers_count: int, new_sp
     </div>
     """
     send_email("📦 Reporte Horario de Alma - Instagram", body_html, is_html=True)
+
+# --- helper: sql server database ---
+def save_users_and_views(new_viewers: list, story_id: str, total_views: int):
+    """
+    Guarda los nuevos usuarios y vistas en las tablas 'StoryUsers' y 'StoryViews'.
+    Actualiza el conteo de vistas y la última vez que se vio la historia para cada usuario.
+    """
+    if not DB_SERVER or not DB_NAME:
+        logger.warning("La configuración de la base de datos no está completa. No se guardará en SQL Server.")
+        return
+
+    cnxn = None
+    try:
+        cnxn = pyodbc.connect(
+            f'DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={DB_SERVER};DATABASE={DB_NAME};Trusted_Connection=yes;'
+        )
+        cursor = cnxn.cursor()
+
+        for viewer in new_viewers:
+            # 1. Comprueba si el usuario ya existe en la tabla 'StoryUsers'
+            cursor.execute("SELECT id FROM StoryUsers WHERE username = ?", viewer)
+            user_row = cursor.fetchone()
+
+            user_id = None
+            if user_row:
+                user_id = user_row[0]
+                logger.info(f"El usuario {viewer} ya existe con el ID {user_id}. Actualizando su conteo de vistas.")
+
+                # 2a. Si el usuario existe, actualiza el conteo de vistas y la última fecha de visualización
+                cursor.execute(
+                    "UPDATE StoryUsers SET total_views_count = total_views_count + 1, last_viewed_at = ? WHERE id = ?",
+                    datetime.now(), user_id
+                )
+            else:
+                # 2b. Si el usuario no existe, insértalo en 'StoryUsers' con un conteo inicial de 1
+                is_special = 1 if viewer.lower() in SPECIAL_USERS else 0
+                cursor.execute(
+                    "INSERT INTO StoryUsers (username, is_special, created_at, total_views_count, last_viewed_at) VALUES (?, ?, ?, ?, ?)",
+                    viewer, is_special, datetime.now(), 1, datetime.now()
+                )
+                cursor.execute("SELECT @@IDENTITY AS id")
+                user_row = cursor.fetchone()
+                user_id = user_row[0] if user_row is not None else None
+                logger.info(f"Nuevo usuario {viewer} insertado con el ID {user_id}.")
+
+            # 3. Inserta la vista en la tabla 'StoryViews'
+            if user_id:
+                cursor.execute(
+                    "INSERT INTO StoryViews (user_id, story_id, viewed_at, total_views) VALUES (?, ?, ?, ?)",
+                    user_id, story_id, datetime.now(), total_views
+                )
+                logger.info(f"La vista de {viewer} para la historia {story_id} ha sido guardada. Vistas totales en ese momento: {total_views}")
+
+        cnxn.commit()
+
+    except pyodbc.Error as e:
+        sqlstate = e.args[0]
+        logger.error(f"Error al conectar o interactuar con la base de datos SQL Server. SQLSTATE: {sqlstate}")
+        logger.error(f"Mensaje de error: {e}")
+    except Exception as e:
+        logger.error(f"Error inesperado al intentar conectar a la base de datos: {e}")
+    finally:
+        if cnxn:
+            cnxn.close()
 
 # --- storage ---
 def load_seen():
@@ -162,6 +227,23 @@ def make_driver():
     logger.info("✅ Se ha creado exitosamente la instancia de Firefox en modo headless con el perfil existente.")
     return driver
 
+def safe_get(driver, url, retries=5):
+    """
+    Intenta cargar una URL con reintentos para manejar errores de red.
+    """
+    for i in range(retries):
+        try:
+            driver.get(url)
+            return True
+        except WebDriverException as e:
+            logger.warning(f"Intento {i+1} de {retries} fallido. Error: {e.msg}")
+            # Retroceso exponencial: espera 2^i segundos
+            sleep_time = 2 ** i
+            logger.info(f"Esperando {sleep_time} segundos antes de reintentar...")
+            time.sleep(sleep_time)
+    logger.error("No se pudo cargar la página después de varios intentos. Saliendo.")
+    return False
+
 # --- scraping logic ---
 def open_my_profile(driver):
     wait = WebDriverWait(driver, 10)
@@ -169,12 +251,7 @@ def open_my_profile(driver):
         url = f"https://www.instagram.com/{INSTAGRAM_USERNAME}/"
     else:
         url = "https://www.instagram.com/"
-    driver.get(url)
-    logger.info("Abierto %s", url)
-    try:
-        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    except TimeoutException:
-        logger.warning("Tiempo de espera agotado al cargar la página.")
+    return safe_get(driver, url)
 
 def get_story_info(driver):
     try:
@@ -254,7 +331,8 @@ def main(stop_flag: Optional[threading.Event] = None, update_gui_callback=None):
 
     seen = load_seen()
     special_user_seen_status = {user: user in seen.get('all_viewers', []) for user in SPECIAL_USERS}
-    story_id = None # Initialize story_id
+    story_id = None
+    current_story_viewers = []
 
     driver = None
     try:
@@ -271,7 +349,8 @@ def main(stop_flag: Optional[threading.Event] = None, update_gui_callback=None):
     new_special_users_this_hour = set()
 
     try:
-        open_my_profile(driver)
+        if not open_my_profile(driver):
+            return
 
         while True:
             current_time = datetime.now()
@@ -302,11 +381,12 @@ def main(stop_flag: Optional[threading.Event] = None, update_gui_callback=None):
 
             if (current_time - last_report_time) >= timedelta(hours=1):
                 logger.info("Enviando reporte horario...")
-                total_viewers_for_report = len(seen.get(story_id, [])) if story_id else 0
+                total_viewers_for_report = len(current_story_viewers)
+                special_users_in_story = {v for v in current_story_viewers if v.lower() in SPECIAL_USERS}
                 send_hourly_report_email(
                     list(new_viewers_this_hour),
                     total_viewers_for_report,
-                    list(new_special_users_this_hour),
+                    list(special_users_in_story),
                     current_time.strftime("%Y-%m-%d %H:%M:%S")
                 )
                 last_report_time = current_time
@@ -314,7 +394,11 @@ def main(stop_flag: Optional[threading.Event] = None, update_gui_callback=None):
                 new_special_users_this_hour = set()
 
             logger.info("Comprobando nuevos espectadores de historias...")
-            driver.get(f"https://www.instagram.com/{INSTAGRAM_USERNAME}/")
+
+            if not safe_get(driver, f"https://www.instagram.com/{INSTAGRAM_USERNAME}/"):
+                # Si safe_get falla después de varios intentos, salimos del bucle
+                continue
+
             time.sleep(5)
 
             ok = open_latest_story(driver)
@@ -344,11 +428,13 @@ def main(stop_flag: Optional[threading.Event] = None, update_gui_callback=None):
                 continue
 
             viewers = fetch_viewers_from_open_story(driver)
+            current_story_viewers = viewers
+            total_views = len(viewers)
 
             if update_gui_callback:
                 update_gui_callback(
                     last_check_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    total_viewers=len(viewers),
+                    total_viewers=total_views,
                     story_age=relative_time
                 )
 
@@ -377,12 +463,6 @@ def main(stop_flag: Optional[threading.Event] = None, update_gui_callback=None):
                 new_special_users_in_check = {user for user in SPECIAL_USERS if user in {v.lower() for v in new}}
 
                 subject = "Nuevos Espectadores de Historias"
-                if new_special_users_in_check:
-                    if "branvxvt" in new_special_users_in_check:
-                        subject = f"🚨 HA VUELTO: ¡Brenda acaba de ver tu historia!"
-                    else:
-                        subject = f"🚨 ALERTA DE USUARIO: ¡{', '.join(new_special_users_in_check)} acaba de ver tu historia!"
-
                 relative_hours = None
                 try:
                     relative_hours_str = relative_time.split(" ")[0]
@@ -391,9 +471,9 @@ def main(stop_flag: Optional[threading.Event] = None, update_gui_callback=None):
                 except Exception:
                     pass
 
-                # Nuevo bloque para generar el mensaje especial de Brenda
                 special_message_html = ""
                 if "branvxvt" in new_special_users_in_check:
+                    subject = "🚨 HA VUELTO: ¡Brenda acaba de ver tu historia!"
                     special_message_html = f"""
                         <h3 style="color: #6a1b9a; text-align: center;">🌌 El Universo ha Conspirado 🌌</h3>
                         <p style="font-size: 1.2em; font-weight: bold; text-align: center; color: #4a148c;">
@@ -405,6 +485,8 @@ def main(stop_flag: Optional[threading.Event] = None, update_gui_callback=None):
 
                 other_special_users_html = ""
                 if len(new_special_users_in_check) > 1 or ("branvxvt" not in new_special_users_in_check and new_special_users_in_check):
+                    if "branvxvt" in new_special_users_in_check:
+                        subject = f"🚨 ALERTA DE USUARIO: ¡{', '.join(new_special_users_in_check)} acaba de ver tu historia!"
                     other_special_users_html = """
                         <div style="text-align: center;">
                             """
@@ -415,7 +497,6 @@ def main(stop_flag: Optional[threading.Event] = None, update_gui_callback=None):
                     if "branvxvt" not in new_special_users_in_check:
                         other_special_users_html = f"<hr style='border-color: #333;'>" + other_special_users_html + f"<hr style='border-color: #333;'>"
 
-                # --- El resto del body_html (sin cambios sustanciales) ---
                 body_html = f"""
                 <div style="font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px; color: #333;">
                     <div style="max-width: 600px; margin: auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1);">
@@ -445,10 +526,12 @@ def main(stop_flag: Optional[threading.Event] = None, update_gui_callback=None):
                 seen[story_id] = sorted(list(set(viewers) | prev))
                 save_seen(seen)
 
+                save_users_and_views(list(new), story_id, total_views)
+
                 new_viewers_this_hour.update(new - new_special_users_in_check)
 
             else:
-                logger.info("No se encontraron nuevos espectadores en esta revisión. Total de espectadores: %d", len(viewers))
+                logger.info("No se encontraron nuevos espectadores en esta revisión. Total de espectadores: %d", total_views)
 
             try:
                 driver.switch_to.active_element.send_keys("\uE00C")
@@ -469,6 +552,5 @@ def main(stop_flag: Optional[threading.Event] = None, update_gui_callback=None):
                 pass
         save_seen(seen)
         logger.info("Saliendo.")
-
 if __name__ == "__main__":
     main()
