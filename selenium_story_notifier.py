@@ -286,7 +286,7 @@ def make_driver():
 
     options = Options()
     options.profile = profile
-    options.add_argument("--headless")
+    # options.add_argument("--headless")
 
     service = FirefoxService(GeckoDriverManager().install())
     driver = webdriver.Firefox(service=service, options=options)
@@ -350,42 +350,59 @@ def fetch_viewers_from_open_story(driver):
     wait = WebDriverWait(driver, 10)
 
     try:
+        # Abrir panel de espectadores
         viewers_button_xpath = "//div[@role='button' and .//span[contains(text(), 'Vista por') or contains(text(), 'Viewed by')]]"
         viewers_button = wait.until(EC.element_to_be_clickable((By.XPATH, viewers_button_xpath)))
         viewers_button.click()
         time.sleep(2)
 
+        # Localizar diálogo principal
         viewers_dialog = wait.until(
-            EC.presence_of_element_located((By.XPATH, "//h2[contains(text(), 'Personas que vieron la historia') or contains(text(), 'Story viewers')]/ancestor::div[starts-with(@class, 'xs83m0k')]"))
+            EC.presence_of_element_located((By.XPATH, "//div[@role='dialog']"))
         )
-        scrollable_container = viewers_dialog.find_element(By.XPATH, ".//div[contains(@style, 'overflow: hidden auto;')]")
+
+        # 🔹 Encontrar contenedor con scroll (dinámico)
+        containers = viewers_dialog.find_elements(By.XPATH, ".//div")
+        viewers_container = None
+        for c in containers:
+            try:
+                is_scrollable = driver.execute_script(
+                    "return arguments[0].scrollHeight > arguments[0].clientHeight;", c
+                )
+                if is_scrollable:
+                    viewers_container = c
+                    break
+            except:
+                continue
+
+        if not viewers_container:
+            raise Exception("❌ No se encontró contenedor scrollable para los espectadores")
 
         all_usernames = set()
-        last_user_count = 0
+        last_user_count = -1
 
-        while True:
-            driver.execute_script("arguments[0].scrollTop += 100;", scrollable_container)
+        # 🔹 Scroll lento incremental (como tenías)
+        while len(all_usernames) > last_user_count:
+            last_user_count = len(all_usernames)
+
+            # Hacer scroll de 100 px
+            driver.execute_script("arguments[0].scrollTop += 100;", viewers_container)
             time.sleep(1)
 
-            current_anchors = scrollable_container.find_elements(By.XPATH, ".//a[starts-with(@href, '/')]")
-            for a in current_anchors:
-                href = a.get_attribute("href")
-                if href and '/' in href:
-                    username = href.split("instagram.com/")[-1].split('?')[0].strip('/')
+            # Extraer usuarios visibles
+            viewer_links = viewers_container.find_elements(By.XPATH, ".//a[starts-with(@href, '/')]")
+            for link in viewer_links:
+                href = link.get_attribute("href")
+                if href:
+                    username = href.strip("/").split("/")[-1]
                     if username:
                         all_usernames.add(username)
 
-            new_user_count = len(all_usernames)
-            if new_user_count == last_user_count:
-                break
-
-            last_user_count = new_user_count
-
-        logger.info("Se han recopilado %d nombres de usuario del panel de espectadores.", len(all_usernames))
+        logger.info("✅ Se han recopilado %d usernames del panel de espectadores.", len(all_usernames))
         return sorted(list(all_usernames))
 
     except TimeoutException:
-        logger.warning("No se pudo encontrar el botón de espectadores o el diálogo. La UI pudo haber cambiado.")
+        logger.warning("⚠️ No se pudo encontrar el botón de espectadores o el diálogo. La UI pudo haber cambiado.")
         return []
     except Exception as e:
         logger.exception("Error al obtener los espectadores: %s", e)
